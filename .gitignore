@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+build/
+dist/
+
+# --- Virtual environment ---
+venv/
+.venv/
+env/
+
+# --- EEG data (large, and CHB-MIT redistribution terms apply — don't commit raw data) ---
+data/
+!data/.gitkeep
+
+# --- Trained models / large artifacts ---
+results/models/*.h5
+results/models/*.keras
+!results/models/.gitkeep
+# Note: baseline.h5 is currently small (~400KB). If you want to keep a
+# specific checkpoint in the repo as a portfolio artifact, force-add it
+# explicitly with `git add -f results/models/baseline.h5` rather than
+# removing this rule — that way large future checkpoints stay out by default.
+
+# --- Notebook / experiment junk ---
+.ipynb_checkpoints/
+*.log
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+*.swp
+
+# --- Matplotlib output you don't intend to track (comment out if you DO want plots versioned) ---
+results/*.png
+!results/.gitkeep
