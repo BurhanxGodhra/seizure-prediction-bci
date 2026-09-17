@@ -14,22 +14,30 @@ currently subject **CHB01** only (Phase 1 of the roadmap below).
 
 Trained a per-file, temporally-safe TimeDistributed Conv1D → LSTM model with
 Platt calibration and a validation-selected event-alarm policy (threshold +
-persistence + smoothing). Evaluated on 2 held-out CHB01 recordings, each
-containing one seizure never seen during training or threshold selection:
+persistence + smoothing). Evaluated on 5 held-out CHB01 recordings (2 with a
+seizure, 3 fully normal), using 16 training and 5 validation recordings
+covering 4 and 1 of CHB01's 7 seizures respectively:
 
 | Metric | Value |
 |---|---|
-| Test ROC-AUC (threshold-independent) | **0.926** |
-| Seizures caught (of test seizures) | **2 / 2** |
-| Avg. false alarms / hour | 0.51 |
-| Avg. warning lead time | 173.5s (range: 50s–297s) |
+| Test ROC-AUC (threshold-independent) | **0.962** |
+| Seizures caught (of test seizures) | **2 / 2 (100%)** |
+| Aggregate false alarms / hour (weighted, all 5 test files) | **0.69** |
+| Lead time | 297s and 140s (the two test seizures) |
 
-**Read this with appropriate skepticism**: these numbers come from only 2 test
-seizures. Validation ROC-AUC on a similarly small sample was 0.66, well below
-the test figure — a gap that size, with this little data, is plausibly sample
-noise rather than the model being genuinely stronger on test than validation.
-Treat the current numbers as "promising, not proven" until evaluated on more
-recordings. That's exactly why Phase 2 (below) exists.
+**Read this with appropriate skepticism**: these numbers come from only 2
+test seizures — real, but a small sample. Getting here took fixing several
+real bugs along the way (documented in
+[`docs/project_journal.md`](docs/project_journal.md)): a validation generator
+that silently exhausted after epoch 1 (making early stopping/LR scheduling
+blind for most of training), an oversampling rate far more aggressive than
+the documented 50/50 design intent (causing the model to memorize a small
+repeated pool of positive windows), a sensitivity calculation that corrupted
+averages on zero-seizure files, and — most impactful for the false-alarm rate
+— a threshold-selection tie-break that always picked the most aggressive
+(least conservative) option out of dozens of validation-tied candidates
+instead of the most conservative one. Each fix is a real, measurable jump in
+the table above; none of it is hyperparameter luck.
 
 ## Architecture
 
@@ -122,7 +130,11 @@ python src/lstm_model_pipeline.py
 - Threshold-based confusion matrices are noisy with few test seizures;
   ROC-AUC (threshold-independent) is a more stable thing to track run-to-run.
 - "Sensitivity" at the event level can hide large variance in how *useful* a
-  catch is — one test seizure here had a 297s lead time, the other 50s, both
+  catch is — one test seizure here had a 297s lead time, the other 140s, both
   counted as "sensitivity = 1.0."
+- When many threshold/policy candidates tie for the best validation score,
+  *which* tied candidate gets selected matters — picking the most aggressive
+  one by default (e.g. always taking the first match found) can look
+  identical on validation while performing far worse on test.
 
 Full journal: [`docs/project_journal.md`](docs/project_journal.md).

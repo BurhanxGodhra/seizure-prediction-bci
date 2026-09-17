@@ -122,26 +122,39 @@ def process_file(file_name, seizure_times, resample_sfreq=128, epoch_duration=2)
 # TRAIN / VAL / TEST FILES (session-level split recommended)
 # =========================================================================
 
+# File list verified against the authoritative chb01-summary.txt on PhysioNet
+# (https://physionet.org/content/chbmit/1.0.0/chb01/chb01-summary.txt).
+# All 7 CHB01 seizures are in files: 03, 04, 15, 16, 18, 21, 26.
+# Test seizure files (21, 26) are kept identical to earlier runs so
+# ROC-AUC/sensitivity stay directly comparable to prior results. Non-seizure
+# files are added to train/val (more negative diversity) and to test
+# specifically (to get a real false-alarms-per-hour-during-normal-life
+# estimate, not just false alarms within the hour surrounding a seizure).
 train_files = [
-    "chb01_01.edf",
-    "chb01_02.edf",
-    "chb01_03.edf",
-    "chb01_05.edf",
-    "chb01_06.edf",
-    "chb01_07.edf",
-    "chb01_15.edf",
-    "chb01_18.edf"
+    # seizure files (4 of 7)
+    "chb01_03.edf", "chb01_04.edf", "chb01_15.edf", "chb01_18.edf",
+    # non-seizure files
+    "chb01_01.edf", "chb01_02.edf", "chb01_05.edf", "chb01_06.edf",
+    "chb01_07.edf", "chb01_08.edf", "chb01_09.edf", "chb01_14.edf",
+    "chb01_17.edf", "chb01_19.edf", "chb01_23.edf", "chb01_27.edf",
 ]
 
 val_files = [
-    "chb01_04.edf",
-    "chb01_16.edf"
+    # seizure file (1 of 7)
+    "chb01_16.edf",
+    # non-seizure files
+    "chb01_10.edf", "chb01_11.edf", "chb01_12.edf", "chb01_13.edf",
 ]
 
 test_files = [
-    "chb01_21.edf",
-    "chb01_26.edf"
+    # seizure files (2 of 7) — unchanged from prior runs for comparability
+    "chb01_21.edf", "chb01_26.edf",
+    # non-seizure files, for a realistic false-alarm-rate-during-normal-life estimate
+    "chb01_20.edf", "chb01_22.edf", "chb01_25.edf",
 ]
+
+# Not yet used (available for a later "full CHB01" pass):
+# chb01_29 through chb01_34, chb01_36 through chb01_43, chb01_46
 
 
 # =========================================================================
@@ -524,8 +537,10 @@ model.compile(
 train_gen = file_level_train_generator(train_data, seq_len=SEQ_LEN, batch_size=32, pos_prob=0.5, positive_weight=6.0)
 val_gen = val_generator_xy(val_data, seq_len=SEQ_LEN, batch_size=32)
 
-steps = max(1, sum(len(r['pos_idx']) + len(r['neg_idx']) for r in train_data) // 32)
-vsteps = max(1, sum((len(r['y']) - SEQ_LEN + 1 -  np.sum(r['y'] == -1)) for r in val_data) // 32)
+steps = max(1, min(500, sum(len(r['pos_idx']) + len(r['neg_idx']) for r in train_data) // 32))
+vsteps = max(1, min(150, sum((len(r['y']) - SEQ_LEN + 1 -  np.sum(r['y'] == -1)) for r in val_data) // 32))
+print(f"\nsteps_per_epoch={steps} (capped at 500), validation_steps={vsteps} (capped at 150) "
+      "-- more train/val files add data diversity, not more time-per-epoch")
 
 es = EarlyStopping(monitor='val_recall', mode='max', patience=8, restore_best_weights=True)
 rlr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
@@ -608,7 +623,6 @@ def select_best_event_policy(model, records, seq_len=SEQ_LEN, candidate_threshol
                 high = min(low + 0.2, 0.95)
             candidate_thresholds = np.linspace(low, high, 30)
 
-    best = None
     best_details = []
     total_seizures = sum(len(get_seizure_times(summary_text, r['file'])) for r in records)
     # helper: compute predicted-positive fraction on validation for a threshold
@@ -671,11 +685,25 @@ def select_best_event_policy(model, records, seq_len=SEQ_LEN, candidate_threshol
                     'score': score,
                 }
                 best_details.append(details)
-                if best is None or score > best['score']:
-                    best = details
 
-    if best is None:
-        return 0.5, 1
+    if not best_details:
+        return 0.5, 1, 3
+
+    # Among all candidates, prefer higher score first. But scores frequently
+    # tie across a wide plateau of thresholds (e.g. every threshold from 0.03
+    # to 0.11 scoring identically on a small/clean validation set) — picking
+    # the FIRST tied candidate (smallest threshold, since thresholds are
+    # iterated ascending) means picking the least conservative option, with
+    # zero margin before it starts false-alarming on real data. Break ties by
+    # preferring the largest threshold, then the largest min_streak, then the
+    # largest smoothing window — same validation performance, more margin.
+    best_score = max(d['score'] for d in best_details)
+    tied = [d for d in best_details if d['score'] == best_score]
+    best = max(tied, key=lambda d: (d['threshold'], d['min_streak'], d['smoothing_window']))
+    if len(tied) > 1:
+        print(f"\n{len(tied)} candidates tied for best validation score ({best_score:.3f}) "
+              f"across thresholds {min(d['threshold'] for d in tied):.2f}-{max(d['threshold'] for d in tied):.2f} "
+              "— picking the most conservative one (largest threshold/min_streak/smoothing) rather than the first found.")
 
     print('\nValidation event-policy sweep (validation only):')
     for d in best_details:
@@ -828,7 +856,11 @@ for r in test_data:
             detected_times.append(alarm_time)
             lead_times.append(float(s - alarm_time))
 
-    sensitivity = detected / max(len(seizures), 1)
+    # sensitivity is only meaningful for files that actually contain a seizure;
+    # a 0-seizure file has nothing to detect, so report NaN (not 0.0) to avoid
+    # silently dragging down "average sensitivity" once normal-only files are
+    # included in evaluation
+    sensitivity = (detected / len(seizures)) if len(seizures) > 0 else float('nan')
 
     # false alarms per hour
     alarm_idx = np.where(final_alarm)[0] if final_alarm.size else np.array([])
@@ -860,7 +892,10 @@ for r in test_data:
     file_results.append({
         'file': file,
         'n_seizures': len(seizures),
+        'detected': detected,
         'sensitivity': sensitivity,
+        'false_clusters': false_clusters,
+        'total_hours': total_hours,
         'fa_per_hr': fa_per_hr,
         'mean_lead_time_sec': lead_time_mean,
     })
@@ -870,9 +905,27 @@ for fr in file_results:
     print(fr)
 
 if file_results:
-    print('\nAverage sensitivity:', np.mean([f['sensitivity'] for f in file_results]))
-    print('Average false alarms/hr:', np.mean([f['fa_per_hr'] for f in file_results]))
-    print('Average lead time (s):', np.mean([f['mean_lead_time_sec'] for f in file_results]))
+    seizure_files = [f for f in file_results if f['n_seizures'] > 0]
+    total_seizures = sum(f['n_seizures'] for f in file_results)
+    total_detected = sum(f['detected'] for f in file_results)
+    total_false_clusters = sum(f['false_clusters'] for f in file_results)
+    total_hours_all = sum(f['total_hours'] for f in file_results)
+
+    print('\n--- Per-file unweighted averages (seizure-containing files only, n=%d) ---' % len(seizure_files))
+    if seizure_files:
+        print('Average sensitivity:', np.mean([f['sensitivity'] for f in seizure_files]))
+        print('Average false alarms/hr:', np.mean([f['fa_per_hr'] for f in seizure_files]))
+        lead_times_nonzero = [f['mean_lead_time_sec'] for f in seizure_files if f['mean_lead_time_sec'] > 0]
+        print('Average lead time (s):', np.mean(lead_times_nonzero) if lead_times_nonzero else 0.0)
+    else:
+        print('No seizure-containing files in test set.')
+
+    print('\n--- Aggregate (weighted) metrics across all %d test files ---' % len(file_results))
+    print(f'Overall seizure-level sensitivity: {total_detected}/{total_seizures} seizures caught'
+          + (f' ({100.0*total_detected/total_seizures:.1f}%)' if total_seizures > 0 else ' (no seizures in test set)'))
+    print(f'Overall false alarms/hr: {total_false_clusters}/{total_hours_all:.2f}hr = '
+          f'{total_false_clusters/max(total_hours_all, 1e-6):.3f}'
+          ' (this is the number that matters for "how often does this bother someone during normal life")')
 
 # ---------------------------------------------------------
 # PREICTAL PROBABILITY TIMELINE (overall concatenated)
